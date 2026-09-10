@@ -1,0 +1,20 @@
+import http from 'node:http';
+import cors from 'cors';
+import express from 'express';
+import { Server } from 'socket.io';
+import { SimulationStore } from './simulationStore.js';
+import type { CommandAction, TargetType } from './types.js';
+
+const app = express(); const server = http.createServer(app); const io = new Server(server, { cors: { origin: '*' } }); const store = new SimulationStore(); const port = Number(process.env.PORT ?? 4000);
+app.use(cors()); app.use(express.json());
+app.get('/api/v1/health', (_req, res) => res.json({ status: 'ok', mode: 'SIMULATION_ENVIRONMENT', timestamp: new Date().toISOString() }));
+app.get('/api/v1/state', (_req, res) => res.json(store.snapshot()));
+app.get('/api/v1/houses', (req, res) => { const city = typeof req.query.city === 'string' ? req.query.city : undefined; res.json(store.houses.filter(h => !city || h.cityId === city)); });
+app.get('/api/v1/houses/:id', (req, res) => { const house = store.houses.find(h => h.id === req.params.id); if (!house) return res.status(404).json({ error: 'House not found' }); return res.json({ ...house, energy: { selfConsumptionKw: Math.min(house.effectiveDemandKw, house.pvKw), importKw: Math.max(0, house.effectiveDemandKw - house.pvKw), exportKw: Math.max(0, house.pvKw - house.effectiveDemandKw) } }); });
+app.get('/api/v1/commands', (_req, res) => res.json(store.commands)); app.get('/api/v1/alerts', (_req, res) => res.json(store.alerts));
+app.post('/api/v1/commands', async (req, res) => { const { targetType, targetId, action, value, durationMinutes, user } = req.body as { targetType: TargetType; targetId: string; action: CommandAction; value?: number; durationMinutes?: number; user?: string }; if (!targetType || !targetId || !action) return res.status(400).json({ error: 'targetType, targetId and action are required' }); if (action === 'setPowerLimit' && (!value || value <= 0)) return res.status(400).json({ error: 'A positive power-limit value is required' }); const command = await store.command({ targetType, targetId, action, value, durationMinutes, user }); return res.status(command.status === 'FAILED' ? 503 : 202).json(command); });
+app.post('/api/v1/simulation', (req, res) => { const { paused, speed, failureRate, scenario } = req.body as { paused?: boolean; speed?: 1 | 2 | 5; failureRate?: number; scenario?: string }; if (typeof paused === 'boolean') store.paused = paused; if (speed && [1, 2, 5].includes(speed)) store.speed = speed; if (typeof failureRate === 'number' && failureRate >= 0 && failureRate <= 1) store.failureRate = failureRate; if (scenario) store.scenario = scenario; res.json(store.snapshot().simulation); });
+app.post('/api/v1/simulation/reset', (_req, res) => { store.reset(); res.status(204).end(); });
+io.on('connection', socket => { socket.emit('state', store.snapshot()); }); store.on('state', state => io.emit('state', state)); store.on('command', command => io.emit('command:update', command));
+setInterval(() => store.tick(), 1000);
+server.listen(port, () => console.log(`CITYOS simulation backend listening on http://localhost:${port}`));
